@@ -526,6 +526,27 @@ class TestGetEntityTypeMissingBranches:
         )
         assert entity.get_entity_type("resetFilter") == BUTTON
 
+    def test_write_command_enum_with_on_off_returns_buttons(self):
+        """Mixed executeCommand enums must not be collapsed into a switch."""
+        from custom_components.electrolux.const import BUTTON
+
+        entity = self._entity_with_cap(
+            "executeCommand",
+            {
+                "type": "string",
+                "access": "write",
+                "values": {
+                    "ON": {},
+                    "OFF": {},
+                    "START": {},
+                    "PAUSE": {},
+                    "RESUME": {},
+                    "STOPRESET": {},
+                },
+            },
+        )
+        assert entity.get_entity_type("executeCommand") == BUTTON
+
     def test_access_constant_returns_sensor(self):
         """L281: access=constant → SENSOR."""
         from custom_components.electrolux.const import SENSOR
