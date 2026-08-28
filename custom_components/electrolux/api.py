@@ -252,7 +252,10 @@ class ElectroluxLibraryEntity:
 
             # Write-only ON/OFF pair (e.g. ice maker control) → single optimistic SWITCH
             # instead of two separate BUTTON entities.
-            if upper_values >= {"ON", "OFF"} and access == "write":
+            # Only a pure ON/OFF capability is a switch. Mixed command enums
+            # such as dishwasher executeCommand also contain START, PAUSE,
+            # RESUME and STOPRESET and must become individual buttons.
+            if upper_values == {"ON", "OFF"} and access == "write":
                 return SWITCH
 
             if access == "readwrite":
