@@ -264,6 +264,10 @@ class TestSseStallWatchdog:
     async def test_watchdog_restarts_stalled_sse(self, coordinator, mock_api):
         app = MagicMock()
         app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+        mock_api.get_appliance_state = AsyncMock(
+            return_value={"properties": {"reported": {"applianceState": "RUNNING"}}}
+        )
 
         coordinator.hass.loop.time.return_value = 1_001_000.0
         coordinator._last_sse_message_time = 1_000_000.0
@@ -294,10 +298,14 @@ class TestSseStallWatchdog:
     async def test_watchdog_respects_restart_cooldown(self, coordinator, mock_api):
         app = MagicMock()
         app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+        mock_api.get_appliance_state = AsyncMock(
+            return_value={"properties": {"reported": {"applianceState": "RUNNING"}}}
+        )
 
-        coordinator.hass.loop.time.return_value = 1_000_200.0
+        coordinator.hass.loop.time.return_value = 1_000_500.0
         coordinator._last_sse_message_time = 1_000_000.0
-        coordinator._last_sse_restart_time = 1_000_100.0
+        coordinator._last_sse_restart_time = 1_000_495.0
         mock_api._sse_task = MagicMock()
         mock_api._sse_task.done.return_value = False
         coordinator.listen_websocket = AsyncMock(return_value=None)

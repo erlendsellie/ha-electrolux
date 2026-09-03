@@ -20,7 +20,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import ElectroluxLibraryEntity
 from .auth_errors import is_auth_error
-from .const import DOMAIN, TIME_ENTITIES_TO_UPDATE
+from .const import DOMAIN, TIME_ENTITIES_TO_UPDATE, ApplianceDesyncAttribute
 from .models import Appliance, Appliances, ApplianceState
 from .util import (
     AuthenticationError,
@@ -604,6 +604,28 @@ class ElectroluxCoordinator(DataUpdateCoordinator):
                     appliance_id,
                 )
                 self._schedule_deferred_update(appliance_id)
+
+            # Desync recovery: if timeToEnd is decrementing while applianceState is NOT
+            # in an active running/drying state, the appliance has started running but the
+            # applianceState SSE event was dropped by the cloud. Force a state refresh.
+            appliance = appliances.get_appliance(appliance_id) if appliances else None
+            current_state = (
+                str(appliance.reported_state.get("applianceState") if appliance else "").upper().replace(" ", "_")
+            )
+            if (
+                current_state not in ACTIVE_TIME_TO_END_STATES
+                and old_value is not None
+                and new_value is not None
+                and 0 < new_value < old_value
+            ):
+                _LOGGER.info(
+                    "timeToEnd decremented (%s → %s) while applianceState=%s for %s — desync detected, scheduling state refresh",
+                    old_value,
+                    new_value,
+                    current_state,
+                    appliance_id,
+                )
+                self._schedule_state_refresh(appliance_id)
 
             # Track this value for next comparison
             self._last_time_to_end[appliance_id] = new_value
@@ -2079,6 +2101,21 @@ class ElectroluxCoordinator(DataUpdateCoordinator):
             if getattr(self, "_sse_retry_task", None) is asyncio.current_task():
                 self._sse_retry_task = None
 
+    @staticmethod
+    def _attribute_values_differ(val1: Any, val2: Any) -> bool:
+        """Compare two attribute values for equality, safely handling numerics, booleans, strings, and nulls."""
+        if val1 == val2:
+            return False
+        if val1 is None or val2 is None:
+            return True
+        if isinstance(val1, bool) or isinstance(val2, bool):
+            return str(val1).lower() != str(val2).lower()
+        try:
+            return float(val1) != float(val2)
+        except ValueError, TypeError:
+            pass
+        return str(val1).strip() != str(val2).strip()
+
     async def _restart_sse_if_stalled(self, app_dict: dict[str, Any]) -> None:
         """Restart SSE if stream is stale while at least one appliance is connected."""
         sse_task = getattr(self.api, "_sse_task", None)
@@ -2086,10 +2123,12 @@ class ElectroluxCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("SSE stall check skipped: SSE task is not running")
             return
 
-        any_connected = any(
-            str(app.state.get("connectivityState", "")).lower() == STATE_CONNECTED for app in app_dict.values()
-        )
-        if not any_connected:
+        connected_apps = {
+            aid: app
+            for aid, app in app_dict.items()
+            if str(app.state.get("connectivityState", "")).lower() == STATE_CONNECTED
+        }
+        if not connected_apps:
             _LOGGER.debug("SSE stall check skipped: no connected appliances")
             return
 
@@ -2104,22 +2143,125 @@ class ElectroluxCoordinator(DataUpdateCoordinator):
             )
             return
 
-        if not self._can_restart_sse():
+        # Cooldown guard: do not probe server during exponential backoff window
+        effective_cooldown = self._sse_backoff_seconds(self._consecutive_sse_restarts)
+        if now - self._last_sse_restart_time <= effective_cooldown:
             _LOGGER.debug(
-                "SSE stall detected (%.1fs since last message) but restart cooldown is active",
-                age,
+                "SSE stall check skipped: restart cooldown is active (%.1fs elapsed, cooldown %.1fs)",
+                now - self._last_sse_restart_time,
+                effective_cooldown,
             )
             return
 
-        _LOGGER.info(
-            "SSE stall detected (%.1fs since last message, threshold %.1fs)",
+        async def _probe(aid: str) -> tuple[str, Any]:
+            try:
+                state = await asyncio.wait_for(
+                    self.api.get_appliance_state(aid),
+                    timeout=UPDATE_TIMEOUT,
+                )
+                return aid, state
+            except Exception as ex:
+                return aid, ex
+
+        probe_results = await asyncio.gather(*(_probe(aid) for aid in connected_apps))
+
+        desync_detected = False
+        desync_reason = None
+        verified_count = 0
+
+        for aid, res in probe_results:
+            app = connected_apps[aid]
+
+            if isinstance(res, Exception):
+                if is_auth_error(res):
+                    _LOGGER.warning("SSE silence probe detected authentication failure for %s: %s", aid, res)
+                    self._consecutive_auth_failures += 1
+                    desync_detected = True
+                    desync_reason = f"authentication failure on {aid}: {res}"
+                    break
+                _LOGGER.debug("SSE silence check: unable to query state for %s: %s", aid, res)
+                continue
+
+            if not isinstance(res, dict):
+                _LOGGER.debug("SSE silence check: invalid response format for %s: %s", aid, type(res))
+                continue
+
+            remote_reported = res.get("properties", {}).get("reported")
+            if not isinstance(remote_reported, dict) or not remote_reported:
+                _LOGGER.debug("SSE silence check: empty or missing reported properties for %s", aid)
+                continue
+
+            verified_count += 1
+            local_reported = (
+                app.reported_state if hasattr(app, "reported_state") and isinstance(app.reported_state, dict) else {}
+            )
+
+            for attr in ApplianceDesyncAttribute:
+                key = attr.value
+                remote_has = key in remote_reported
+                local_has = key in local_reported
+
+                if not remote_has and not local_has:
+                    continue
+
+                remote_val = remote_reported.get(key)
+                local_val = local_reported.get(key)
+
+                if self._attribute_values_differ(remote_val, local_val):
+                    desync_detected = True
+                    desync_reason = f"{aid} {key}: remote={remote_val} vs local={local_val}"
+                    break
+
+            if desync_detected:
+                break
+
+        # Symmetrical verification: retain socket if all connected appliances match cloud state
+        if not desync_detected and verified_count == len(connected_apps) and verified_count > 0:
+            _LOGGER.debug(
+                "SSE silence check: all %d appliance(s) match cloud state (%.1fs quiet), stream healthy",
+                verified_count,
+                age,
+            )
+            self._last_sse_message_time = now
+            return
+
+        # Handle failed/partial verification: check fallback threshold to avoid permanent stall suppression
+        if not desync_detected:
+            if age > 2 * SSE_STALL_THRESHOLD:
+                _LOGGER.warning(
+                    "SSE stream silent for %.1fs (fallback threshold %.1fs exceeded) and REST verification unreachable (%d/%d verified) — forcing restart",
+                    age,
+                    2 * SSE_STALL_THRESHOLD,
+                    verified_count,
+                    len(connected_apps),
+                )
+                desync_detected = True
+                desync_reason = f"persistent silence ({age:.1f}s) with unverified REST state"
+            else:
+                _LOGGER.debug(
+                    "SSE silence check: partial or failed REST verification (%d/%d verified, %.1fs quiet), skipping restart",
+                    verified_count,
+                    len(connected_apps),
+                    age,
+                )
+                return
+
+        # Double-check restart cooldown before executing restart
+        if not self._can_restart_sse():
+            _LOGGER.debug(
+                "SSE desync detected (%s) but restart cooldown is active",
+                desync_reason,
+            )
+            return
+
+        _LOGGER.warning(
+            "SSE desync detected (%s, %.1fs since last message) — restarting stream",
+            desync_reason,
             age,
-            SSE_STALL_THRESHOLD,
         )
         self._consecutive_sse_restarts += 1
         self._last_sse_restart_log_count = getattr(self, "_last_sse_restart_log_count", 0) + 1
 
-        # Log summary every 5 restarts or on the first few to avoid spam
         backoff_seconds = self._sse_backoff_seconds(self._consecutive_sse_restarts)
         backoff_desc = f"{int(backoff_seconds)}s" if backoff_seconds < 60 else f"{backoff_seconds / 60:.1f}min"
         log_count = getattr(self, "_last_sse_restart_log_count", 0)

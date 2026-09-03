@@ -66,7 +66,7 @@ def mock_config_entry():
     return entry
 
 
-def _make_coordinator():
+def _make_coordinator() -> Any:
     """Instantiate a real ElectroluxCoordinator object with mocked internals."""
     mock_loop = MagicMock()
     mock_loop.time.return_value = 1_000_000.0
@@ -104,6 +104,7 @@ def _make_coordinator():
         coord._last_sse_disconnect_reason = None
         coord._consecutive_sse_drops = 0
         coord._consecutive_sse_restarts = 0
+        coord._consecutive_auth_failures = 0
         coord._last_sse_message_time = 0.0
         coord._last_sse_restart_time = 0.0
         coord._sse_data_received_since_connect = False
@@ -306,6 +307,217 @@ class TestCoordinatorDiagnosticMethods:
             await coordinator._check_api_health()
             assert coordinator.api_connected is False
             assert coordinator.consecutive_api_failures == 2
+
+    def _setup_watchdog(self, msg_time: float = 500.0, loop_time: float = 1000.0):
+        coordinator = _make_coordinator()
+        coordinator._last_sse_message_time = msg_time
+        coordinator.hass.loop.time.return_value = loop_time
+
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        coordinator.api._sse_task = mock_task
+        coordinator.api.disconnect_websocket = AsyncMock()
+        coordinator.listen_websocket = AsyncMock()
+        return coordinator
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_silence_matching_state_retains_connection(self):
+        """Test _restart_sse_if_stalled keeps socket open when REST state matches local cache."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        coordinator.api.get_appliance_state = AsyncMock(
+            return_value={"properties": {"reported": {"applianceState": "OFF", "doorState": "CLOSED"}}}
+        )
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF", "doorState": "CLOSED"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_not_called()
+        assert coordinator._last_sse_message_time == 1000.0
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_silence_mismatching_state_triggers_reconnect(self):
+        """Test _restart_sse_if_stalled forces reconnect when REST state reveals a desync."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        remote_status = {"properties": {"reported": {"applianceState": "RUNNING", "doorState": "CLOSED"}}}
+        coordinator.api.get_appliance_state = AsyncMock(return_value=remote_status)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF", "doorState": "CLOSED"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_awaited_once()
+        coordinator.listen_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_skips_probes_during_cooldown(self):
+        """Test _restart_sse_if_stalled does not call REST API while restart cooldown is active."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+        coordinator._last_sse_restart_time = 995.0  # 5s elapsed < 15s base cooldown
+        coordinator._consecutive_sse_restarts = 0
+        coordinator.api.get_appliance_state = AsyncMock()
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.get_appliance_state.assert_not_called()
+        coordinator.api.disconnect_websocket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_detects_key_removal_desync(self):
+        """Test _restart_sse_if_stalled detects desync when a key is present locally but removed in cloud."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        remote_status = {"properties": {"reported": {"applianceState": "END_OF_CYCLE"}}}
+        coordinator.api.get_appliance_state = AsyncMock(return_value=remote_status)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "RUNNING", "timeToEnd": 60}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_awaited_once()
+        coordinator.listen_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_numeric_comparison_equality(self):
+        """Test _restart_sse_if_stalled handles int vs float equality without false desync."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        remote_status = {"properties": {"reported": {"applianceState": "RUNNING", "targetTemperatureC": 40.0}}}
+        coordinator.api.get_appliance_state = AsyncMock(return_value=remote_status)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "RUNNING", "targetTemperatureC": 40}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_not_called()
+        assert coordinator._last_sse_message_time == 1000.0
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_partial_probe_failure_retains_timestamp(self):
+        """Test _restart_sse_if_stalled does not advance silence clock if some appliances fail REST probes."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        async def _mock_get_state(aid):
+            if aid == "app1":
+                return {"properties": {"reported": {"applianceState": "OFF"}}}
+            raise aiohttp.ClientError("Timeout on app2")
+
+        coordinator.api.get_appliance_state = AsyncMock(side_effect=_mock_get_state)
+
+        app1 = MagicMock()
+        app1.state = {"connectivityState": "connected"}
+        app1.reported_state = {"applianceState": "OFF"}
+
+        app2 = MagicMock()
+        app2.state = {"connectivityState": "connected"}
+        app2.reported_state = {"applianceState": "OFF"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app1, "app2": app2})
+
+        coordinator.api.disconnect_websocket.assert_not_called()
+        assert coordinator._last_sse_message_time == 500.0
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_auth_error_triggers_reconnect(self):
+        """Test _restart_sse_if_stalled triggers reconnect and records auth failure on 401 response."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        auth_err = aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=401,
+            message="Unauthorized",
+        )
+        coordinator.api.get_appliance_state = AsyncMock(side_effect=auth_err)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        assert coordinator._consecutive_auth_failures == 1
+        coordinator.api.disconnect_websocket.assert_awaited_once()
+        coordinator.listen_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_persistent_rest_failure_recovers_after_fallback_threshold(self):
+        """Test _restart_sse_if_stalled forces restart when silence exceeds fallback threshold (600s)."""
+        coordinator = self._setup_watchdog(300.0, 1000.0)  # 700s elapsed > 600s fallback threshold
+
+        coordinator.api.get_appliance_state = AsyncMock(side_effect=aiohttp.ClientError("Server 500"))
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_awaited_once()
+        coordinator.listen_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_api_error_leaves_socket_alone_before_fallback(self):
+        """Test _restart_sse_if_stalled does not kill socket if REST query fails before fallback threshold."""
+        coordinator = self._setup_watchdog(650.0, 1000.0)  # 350s elapsed (between 300s stall and 600s fallback)
+
+        coordinator.api.get_appliance_state = AsyncMock(side_effect=aiohttp.ClientError("Timeout"))
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_detects_desync_on_non_laundry_attributes(self):
+        """Test _restart_sse_if_stalled detects state mismatch on non-laundry attributes."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        remote_status = {"properties": {"reported": {"workMode": "AUTO", "fanSpeed": 3}}}
+        coordinator.api.get_appliance_state = AsyncMock(return_value=remote_status)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"workMode": "OFF", "fanSpeed": 0}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_awaited_once()
+        coordinator.listen_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sse_watchdog_ignores_passive_sensor_decay(self):
+        """Test _restart_sse_if_stalled ignores non-operational passive decay (displayTemperatureC cooldown)."""
+        coordinator = self._setup_watchdog(500.0, 1000.0)
+
+        remote_status = {"properties": {"reported": {"applianceState": "OFF", "displayTemperatureC": 40}}}
+        coordinator.api.get_appliance_state = AsyncMock(return_value=remote_status)
+
+        app = MagicMock()
+        app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF", "displayTemperatureC": 60}
+
+        await coordinator._restart_sse_if_stalled({"app1": app})
+
+        coordinator.api.disconnect_websocket.assert_not_called()
+        assert coordinator._last_sse_message_time == 1000.0
 
     def test_coordinator_record_api_methods(self):
         """Test record_api_success and record_api_failure on coordinator."""

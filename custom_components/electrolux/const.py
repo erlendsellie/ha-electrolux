@@ -1,5 +1,6 @@
 """The Electrolux constants."""
 
+from enum import StrEnum
 from typing import Literal
 
 from homeassistant.const import EntityCategory, Platform
@@ -31,6 +32,55 @@ PLATFORMS = [
     TEXT,
     VACUUM,
 ]
+
+
+class ApplianceDesyncAttribute(StrEnum):
+    """Operational state attributes evaluated for SSE stream desynchronization.
+
+    Each attribute corresponds to an active state-bearing property across the
+    14 appliance catalogs that must be pushed in real-time over the SSE stream.
+    Passive sensor decay (e.g. displayTemperatureC cooldown) and internal counters
+    (e.g. filterLife) are intentionally omitted to prevent false reconnects on idle devices.
+    """
+
+    # Operational lifecycle across Laundry, Dishwashers, Ovens, Hobs
+    APPLIANCE_STATE = "applianceState"
+
+    # Physical access & safety across Laundry, Dishwashers, Refrigerators, Ovens
+    DOOR_STATE = "doorState"
+    DOOR_LOCK = "doorLock"
+
+    # Cycle countdown timer
+    TIME_TO_END = "timeToEnd"
+
+    # Power status across Climate, Air Purifiers, Dehumidifiers, Refrigerators
+    POWER_STATE = "powerState"
+
+    # Operating modes across Climate, Air Purifiers, Hobs
+    WORK_MODE = "workMode"
+    HOB_WORK_MODE = "hobWorkMode"
+
+    # Robotic Vacuum Cleaners (RVC) active states
+    STATUS = "status"
+    ROBOT_STATUS = "robotStatus"
+    ACTIVITY = "activity"
+
+    # Temperature setpoints across Climate, Ovens, Refrigerators
+    TARGET_TEMPERATURE_C = "targetTemperatureC"
+    TARGET_TEMPERATURE_F = "targetTemperatureF"
+
+    # Fan speeds across Climate, Air Purifiers, Hoods
+    FAN_SPEED = "fanSpeed"
+
+    # Program selection
+    PROGRAM = "program"
+    PROGRAM_UID = "programUID"
+
+    # Cavity illumination & physical alerts
+    CAVITY_LIGHT = "cavityLight"
+    WATER_TANK_EMPTY = "waterTankEmpty"
+    FOOD_PROBE_INSERTION_STATE = "foodProbeInsertionState"
+
 
 # Configuration and options
 CONF_NOTIFICATION_DEFAULT = "notifications"

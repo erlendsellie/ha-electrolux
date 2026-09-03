@@ -333,6 +333,10 @@ class TestCanRestartSse:
 
         app = MagicMock()
         app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+        coordinator.api.get_appliance_state = AsyncMock(
+            return_value={"properties": {"reported": {"applianceState": "RUNNING"}}}
+        )
         app_dict = {"app1": app}
 
         coordinator.api.disconnect_websocket = AsyncMock()
@@ -358,6 +362,10 @@ class TestCanRestartSse:
 
         app = MagicMock()
         app.state = {"connectivityState": "connected"}
+        app.reported_state = {"applianceState": "OFF"}
+        coordinator.api.get_appliance_state = AsyncMock(
+            return_value={"properties": {"reported": {"applianceState": "RUNNING"}}}
+        )
         app_dict = {"app1": app}
 
         coordinator.api.disconnect_websocket = AsyncMock()
